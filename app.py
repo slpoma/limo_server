@@ -93,7 +93,6 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "start_dm" and nickname:
                 target = parsed.get("target")
                 async with db_pool.acquire() as conn:
-                    # Проверка на блокировку
                     is_blocked = await conn.fetchrow("SELECT 1 FROM blocks WHERE owner=$1 AND blocked=$2", target, nickname)
                     if is_blocked:
                         await websocket.send_text(json.dumps({"status": "error", "msg": "Вы в чёрном списке у этого пользователя"}))
