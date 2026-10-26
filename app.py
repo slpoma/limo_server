@@ -109,14 +109,20 @@ async def websocket_endpoint(websocket: WebSocket):
                         else: room_list.append({"id": r["id"], "name": r["name"], "is_group": True})
                     
                     blocked = [b["blocked_login"] for b in await conn.fetch("SELECT blocked_login FROM blocks WHERE owner_login=$1", login)]
-                    all_users = [{"login": u["login"], "nickname": u["nickname"], "username": u["username"]} for u in await conn.fetch("SELECT login, nickname, username FROM users WHERE login != $1", login)]
-                    settings = {"hide_online": user["hide_online"], "auto_reply": user["auto_reply"], "nickname": user["nickname"], "username": user["username"], "language": user["language"]}
+                    
+                    # Скрываем контакты в поиске, если пользователь включил это
+                    all_users = []
+                    for u in await conn.fetch("SELECT login, nickname, username, hide_contact FROM users WHERE login != $1", login):
+                        display_login = u["login"] if not u["hide_contact"] else u["username"]
+                        all_users.append({"login": display_login, "nickname": u["nickname"], "username": u["username"]})
+                    
+                    settings = {"hide_online": user["hide_online"], "auto_reply": user["auto_reply"], "nickname": user["nickname"], "username": user["username"], "language": user["language"], "hide_contact": user["hide_contact"]}
                     
                     await websocket.send_text(json.dumps({"status": "ok", "rooms": room_list, "all_users": all_users, "blocked": blocked, "settings": settings}))
 
             elif action == "update_settings" and login:
                 async with db_pool.acquire() as conn:
-                    await conn.execute("UPDATE users SET hide_online=$1, auto_reply=$2, language=$3 WHERE login=$4", parsed.get("hide_online", False), parsed.get("auto_reply", ""), parsed.get("language", "en"), login)
+                    await conn.execute("UPDATE users SET hide_online=$1, auto_reply=$2, language=$3, hide_contact=$4 WHERE login=$5", parsed.get("hide_online", False), parsed.get("auto_reply", ""), parsed.get("language", "en"), parsed.get("hide_contact", False), login)
                     await websocket.send_text(json.dumps({"status": "ok", "msg": "Settings saved"}))
             
-            # ... (остальной код report_user, start_dm, get_history, send_message остается таким же, как в прошлом сообщении) ...
+            # ... (код report_user, start_dm, get_history, send_message остается таким же, как в прошлом сообщении) ...
