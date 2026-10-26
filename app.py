@@ -1,14 +1,13 @@
 import os
 import json
-import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import asyncpg
+import hashlib
 from fastapi.middleware.cors import CORSMiddleware
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Храним активные подключения в словаре: {"nickname": websocket}
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, WebSocket] = {}
@@ -33,22 +32,15 @@ db_pool = None
 
 async def init_db():
     global db_pool
-    if not DATABASE_URL:
-        print("⚠️ DATABASE_URL не задан!")
-        return
+    if not DATABASE_URL: return
     try:
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL, 
-            min_size=1, 
-            max_size=5,
-            statement_cache_size=0 # ВАЖНО для Supabase
-        )
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0)
         async with db_pool.acquire() as conn:
-            # Обновляем таблицу сообщений для поддержки ЛС (добавляем sender и recipient)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     nickname TEXT PRIMARY KEY,
-                    last_seen TIMESTAMP DEFAULT NOW()
+                    password_hash TEXT,
+                    contact TEXT UNIQUE
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id SERIAL PRIMARY KEY,
@@ -58,71 +50,67 @@ async def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
-        print("✅ База данных подключена и готова.")
+        print("✅ База данных подключена!")
     except Exception as e:
-        print(f"❌ Ошибка подключения к БД: {e}")
+        print(f"❌ Ошибка БД: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     yield
-    if db_pool:
-        await db_pool.close()
+    if db_pool: await db_pool.close()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-@app.websocket("/ws/{nickname}")
-async def websocket_endpoint(websocket: WebSocket, nickname: str):
-    await manager.connect(nickname, websocket)
-    print(f"✅ Пользователь {nickname} подключился")
-    
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    # Ждем первого сообщения для авторизации
+    await websocket.accept()
+    nickname = None
     try:
         while True:
             data = await websocket.receive_text()
             if data == "ping": continue
-            
-            try:
-                parsed = json.loads(data)
-                action = parsed.get("action")
+            parsed = json.loads(data)
+            action = parsed.get("action")
+
+            if action == "register":
+                # Проверка, занят ли ник
+                nick = parsed.get("nickname")
+                contact = parsed.get("contact")
+                pwd = parsed.get("password")
+                pwd_hash = hashlib.sha256(pwd.encode()).hexdigest()
                 
-                if action == "send_message":
-                    recipient = parsed.get("recipient")
-                    text = parsed.get("text")
-                    
-                    # Сохраняем в базу
-                    if db_pool:
-                        async with db_pool.acquire() as conn:
-                            await conn.execute(
-                                "INSERT INTO messages (sender, recipient, text) VALUES ($1, $2, $3)",
-                                nickname, recipient, text
-                            )
-                    
-                    # Отправляем получателю
-                    msg_payload = json.dumps({
-                        "action": "new_message",
-                        "sender": nickname,
-                        "text": text
-                    })
+                async with db_pool.acquire() as conn:
+                    try:
+                        await conn.execute("INSERT INTO users (nickname, password_hash, contact) VALUES ($1, $2, $3)", nick, pwd_hash, contact)
+                        await websocket.send_text(json.dumps({"status": "ok", "msg": "Регистрация успешна"}))
+                    except asyncpg.exceptions.UniqueViolationError:
+                        await websocket.send_text(json.dumps({"status": "error", "msg": "Никнейм или контакт уже заняты!"}))
+
+            elif action == "login":
+                nickname = parsed.get("nickname")
+                pwd = parsed.get("password")
+                pwd_hash = hashlib.sha256(pwd.encode()).hexdigest()
+                
+                async with db_pool.acquire() as conn:
+                    user = await conn.fetchrow("SELECT * FROM users WHERE nickname=$1 AND password_hash=$2", nickname, pwd_hash)
+                    if user:
+                        manager.active_connections[nickname] = websocket
+                        await websocket.send_text(json.dumps({"status": "ok", "msg": "Вход выполнен"}))
+                        await websocket.send_text(json.dumps({"action": "get_users", "users": [r["nickname"] for r in await conn.fetch("SELECT nickname FROM users WHERE nickname != $1", nickname)]}))
+                    else:
+                        await websocket.send_text(json.dumps({"status": "error", "msg": "Неверный ник или пароль"}))
+
+            elif action == "send_message":
+                recipient = parsed.get("recipient")
+                text = parsed.get("text")
+                if nickname:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute("INSERT INTO messages (sender, recipient, text) VALUES ($1, $2, $3)", nickname, recipient, text)
+                    msg_payload = json.dumps({"action": "new_message", "sender": nickname, "text": text})
                     await manager.send_personal_message(msg_payload, recipient)
-                    
-                elif action == "get_users":
-                    # Отправляем список всех, кто есть в базе (кроме себя)
-                    if db_pool:
-                        async with db_pool.acquire() as conn:
-                            users = await conn.fetch("SELECT nickname FROM users WHERE nickname != $1", nickname)
-                            user_list = [u["nickname"] for u in users]
-                            await websocket.send_text(json.dumps({"action": "user_list", "users": user_list}))
-                            
-                elif action == "register":
-                    # Регистрируем пользователя в БД при входе
-                    if db_pool:
-                        async with db_pool.acquire() as conn:
-                            await conn.execute("INSERT INTO users (nickname) VALUES ($1) ON CONFLICT DO NOTHING", nickname)
-                            
-            except Exception as e:
-                print(f"Ошибка обработки данных от {nickname}: {e}")
-                
+
     except WebSocketDisconnect:
-        manager.disconnect(nickname)
-        print(f"❌ Пользователь {nickname} отключился")
+        if nickname: manager.disconnect(nickname)
